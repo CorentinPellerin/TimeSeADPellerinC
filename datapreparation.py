@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import torch
 import importlib
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, QuantileTransformer, PowerTransformer
 
 def data_collection(file_path, time_col):
     df = pd.read_csv(file_path, delimiter=';', skiprows=1, low_memory=False) #skiprows a adapter selon la position des colonnes du fichier
@@ -64,37 +64,39 @@ print(df_empty_columns)
 
 #df.head, .tail, .info, .describe, .shape
 
-#Visualisation de l'ensemble des features
-fig, axes = plt.subplots(nrows=7, ncols=7, figsize=(20, 15))
-axes = axes.flatten()
+def UpstreamDataVisualization(df2):
+    fig, axes = plt.subplots(nrows=7, ncols=7, figsize=(20, 15))
+    axes = axes.flatten()
 
-for i, col in enumerate(df2.columns):
-    df2[col].plot(ax=axes[i], title=col, alpha=0.7)
+    for i, col in enumerate(df2.columns):
+        df2[col].plot(ax=axes[i], title=col, alpha=0.7)
 
-plt.tight_layout()
-plt.show()
-
-# Diviser les colonnes en groupes logiques
-groups = {
+    plt.tight_layout()
+    plt.show()
+    
+    groups = {
     "Moteur": ["rpm", "Nm", "%"],
     "Températures": ["°C.1", "°C.2", "°C.3"],
     "Pressions": ["hPa"],
     "Émissions": ["ppm", "g/s", "mg/s"],
 }
 
-for category, cols in groups.items():
-    plt.figure(figsize=(10, 5))
-    sns.boxplot(data=df2[cols])
-    plt.xticks(rotation=45)
-    plt.title(f"Distribution des variables - {category}")
-    plt.show()
+    for category, cols in groups.items():
+        plt.figure(figsize=(10, 5))
+        sns.boxplot(data=df2[cols])
+        plt.xticks(rotation=45)
+        plt.title(f"Distribution des variables - {category}")
+        plt.show()
     
-#AFFICHE LA DISTRIBUTION DES VARIABLES
-plt.figure(figsize=(12, 6))
-sns.boxplot(data=df2)
-plt.xticks(rotation=90)
-plt.title("Distribution des variables AVANT correction")
-plt.show()
+    #AFFICHE LA DISTRIBUTION DES VARIABLES
+    plt.figure(figsize=(12, 6))
+    sns.boxplot(data=df2)
+    plt.xticks(rotation=90)
+    plt.title("Distribution des variables AVANT correction")
+    plt.show()
+    #Visualisation de l'ensemble des features
+
+
 
 feature = "ppm" if "ppm" in df2.columns else df2.columns[0]
 
@@ -294,7 +296,7 @@ class MethodChooser:
             raise ImportError(f" Erreur lors de l'importation de {selected_model}: {e}")
             
 class UpstreamDataPreparation:
-    def __init__(self, method="IQR", threshold=3.0, seq_length=50, scale_method="standard", interpolation_method ="linear"):
+    def __init__(self, method=None, threshold=None, seq_length=None, scale_method=None, interpolation_method =None):
         self.method = method  # Méthode de détection des outliers (IQR ou MAD)
         self.threshold = threshold  # Seuil pour détecter les outliers
         self.seq_length = seq_length  # Longueur des séquences temporelles
@@ -376,10 +378,23 @@ class UpstreamDataPreparation:
         """
         Normalisation des données avec MinMaxScaler ou StandardScaler.
         """
-        if self.scale_method == "minmax":
-            self.scaler = MinMaxScaler()
-        else:
+        scale_method = self.scale_method.lower()
+    
+        if scale_method == "minmax":
+            self.scaler = MinMaxScaler(feature_range=(0, 1))
+        elif scale_method == "standard":
             self.scaler = StandardScaler()
+        elif scale_method == "robust":
+            self.scaler = RobustScaler()
+        elif scale_method == "quantile":
+            # Vous pouvez choisir 'uniform' ou 'normal' pour output_distribution
+            self.scaler = QuantileTransformer(output_distribution='uniform', random_state=0)
+        elif scale_method == "power":
+            # Yeo-Johnson gère les données négatives et positives
+            self.scaler = PowerTransformer(method='yeo-johnson')
+        else:
+            raise ValueError("Méthode de normalisation non reconnue. Utilisez 'minmax', 'standard', 'robust', 'quantile' ou 'power'.")
+    
         
         train_data_scaled = pd.DataFrame(self.scaler.fit_transform(train_data), 
                                          columns=train_data.columns, index=train_data.index)
