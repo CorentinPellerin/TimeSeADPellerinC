@@ -353,6 +353,7 @@ class UpstreamDataPreparation:
             data_clean.loc[mask, col] = np.nan  # Remplace uniquement les vraies erreurs
 
         nan_ratio = data_clean.isna().sum().sum() / data_clean.size
+        method = self.interpolation_method
 
         if nan_ratio < 0.02:  # Seuil de 2% pour suppression des NaN
             print(f"Ratio de NaN ({nan_ratio:.2%}) sous le seuil de 2%, suppression des NaN.")
@@ -360,7 +361,7 @@ class UpstreamDataPreparation:
         else:
             #reconstruire les NaN du tableau (erreurs capteurs initialement présentes + outliers moteurs) par interpolation
             print(f"Ratio de NaN ({nan_ratio:.2%}) supérieur au seuil de 2%, interpolation appliquée.")
-            data_clean = data_clean.interpolate(method="linear").bfill()
+            data_clean = data_clean.interpolate(method=method).bfill()
 
         total_clean_values = data_clean.size        
         anomaly_ratio = (total_anomalies / total_clean_values) * 100
