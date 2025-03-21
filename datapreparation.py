@@ -7,43 +7,13 @@ import seaborn as sns
 import torch
 import importlib
 from sklearn.preprocessing import MinMaxScaler, StandardScaler, RobustScaler, QuantileTransformer, PowerTransformer
+from timesead.data.dataset import BaseTSDataset
+from timesead.data.transforms.dataset_source import DatasetSource
+from timesead.data.transforms.pipeline_dataset import PipelineDataset 
+from timesead.data.transforms.window_transform import WindowTransform
+from timesead.data.transforms.target_transforms import PredictionTargetTransform
 
-def data_collection(file_path, time_col):
-    df = pd.read_csv(file_path, delimiter=';', skiprows=1, low_memory=False) #skiprows a adapter selon la position des colonnes du fichier
     
-    # Vérifier si la colonne de dates est présente dans le DataFrame
-    if time_col in df.columns:
-        df[time_col] = pd.to_numeric(df[time_col])
-        df.set_index(time_col, inplace=True)
-
-        empty_columns = df.columns[df.isna().all()]
-        print(f"Colonnes totalement vides avant suppression : {list(empty_columns)}")
-
-        df_cleaned = df.dropna(axis=1, how="all")
-        print("Colonnes supprimées !")
-            
-        if not df.index.is_monotonic_increasing: #peu utile car fichiers APL normalement bien indéxés
-            print("L'index n'est pas trié. Tri en cours...")
-            df.sort_index(inplace=True)
-            print("L'index a été trié avec succès.")
-        
-    else:
-        print(f"La colonne '{time_col}' n'a pas été trouvée. L'index par défaut sera utilisé.")
-        
-    
-    return df_cleaned
-    
-file_path = "C:/Users/pellerinc/Downloads/occupancy+detection/datatest2.txt"
-APLfile_path = "C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/i.O/WLTC_1.csv"
-#df1 = read_with_time_index(file_path,'date')
-df2 = data_collection("C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/i.O/WLTC_1.csv", 's') # In Ordnung
-dftest = data_collection("C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/i.O/WLTC_8.csv", 's') # In Ordnung
-df3 = data_collection("C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/n.i.O/WLTC_118.csv", 's') # Nicht in Ordnung
-df4 = data_collection("C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/n.i.O/WLTC_119.csv", 's') # Nicht in Ordnung
-df5 = data_collection("C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/n.i.O/WLTC_120.csv", 's') # Nicht in Ordnung
-df6 = data_collection("C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/n.i.O/WLTC_121.csv", 's') # Nicht in Ordnung
-df7 = data_collection("C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/n.i.O/WLTC_122.csv", 's') # Nicht in Ordnung
-
 #Pour voir quelles sont les colonnes vides dans tous les fichiers In Ordnung
 folder_path = "C:/Users/pellerinc/TimeSeAD-master/Daten_von_APL/Export/i.O"
 file_paths = glob.glob(os.path.join(folder_path, "WLTC_*.csv"))  # Trouver tous les fichiers WLTC_i.csv
@@ -60,7 +30,7 @@ for file_path in file_paths:
 
 df_empty_columns = pd.DataFrame(list(empty_columns_per_file.items()), columns=["Fichier", "Colonnes Vides"])
 
-print(df_empty_columns)
+# print(df_empty_columns)
 
 #df.head, .tail, .info, .describe, .shape
 
@@ -97,7 +67,7 @@ def UpstreamDataVisualization(df2):
     #Visualisation de l'ensemble des features
 
 
-
+'''
 feature = "ppm" if "ppm" in df2.columns else df2.columns[0]
 
 # Introduire artificiellement des valeurs manquantes pour simuler une interpolation
@@ -114,11 +84,13 @@ for method in methods:
     df_interpolated = df_test.interpolate(method=method, order=3 if method == "spline" else None)
     plt.plot(df_interpolated.index, df_interpolated[feature], label=f"Interpolé ({method})", alpha=0.7)
 
+
 plt.legend()
 plt.title(f"Comparaison des interpolations pour {feature}")
 plt.xlabel("Temps")
 plt.ylabel("Valeur")
 plt.show()
+'''
 
 MODEL_MAP_original = {
     "Reconstruction": {
@@ -191,118 +163,81 @@ MODEL_MAP = {
         "lstm_ae_ocsvm": "timesead.models.other.lstm_ae_ocsvm.LSTMAE_OCSVM"
     }
 }
+class SingleSequenceDataset(BaseTSDataset):
+    def __init__(self, tensor):
+        """
+        :param tensor: tenseur de forme (T, num_features) représentant une seule série temporelle.
+        """
+        self.tensor = tensor
 
-class MethodChooser:
-    """
-    Classe responsable de l'analyse du dataset et de la sélection automatique du modèle.
-    """
+    def __len__(self):
+        return 1
 
+    def __getitem__(self, index):
+        if index != 0:
+            raise IndexError("SingleSequenceDataset n'a qu'une seule séquence.")
+        # Retourne la série complète en entrée ET en cible
+        return (self.tensor,), (self.tensor,)
+
+    @property
+    def seq_len(self):
+        return self.tensor.shape[0]
+
+    @property
+    def num_features(self):
+        return self.tensor.shape[1]
+        
     @staticmethod
-    def analyze_dataset(data, labels=None):
-        """Analyse le dataset pour extraire les caractéristiques principales."""
-        num_samples, num_features = data.shape
-        labels_available = labels is not None and len(labels) == num_samples
-
-        # Calcul du ratio d'anomalies (si les labels existent)
-        if labels_available and len(labels) > 0:
-            anomaly_ratio = np.sum(labels) / len(labels)
-        else:
-            anomaly_ratio = 0
-
-        # Déterminer le type d'anomalie
-        anomaly_type = (
-            "point" if anomaly_ratio < 0.01 else
-            "contextual" if anomaly_ratio < 0.05 else
-            "collective"
-        ) if labels_available else "unknown"
-
-        # Vérifier si le dataset est en temps réel (grande taille et plusieurs features)
-        real_time = num_samples > 10_000 and num_features > 5
-
-        return {
-            "num_samples": num_samples,
-            "num_features": num_features,
-            "labels_available": labels_available,
-            "anomaly_type": anomaly_type,
-            "real_time": real_time
-        }
-
+    def get_default_pipeline() -> dict:
+        """
+        Retourne le pipeline par défaut pour ce dataset.
+        Ici, on retourne un dictionnaire vide.
+        """
+        return {}
+        
     @staticmethod
-    def select_best_model(data, labels_available=False, anomaly_type="point", real_time=False, forced_model=None):
-        """Sélectionne et importe automatiquement le modèle optimal."""
-        if forced_model:
-            selected_model = forced_model
-        else:
-            num_samples, num_features = data.shape
-
-            model_choices = {
-                "point": "lstm_ae" if not labels_available else "gdn",
-                "contextual": "anom_trans" if not labels_available else "mtad_gat",
-                "collective": "mscred" if not labels_available else "thoc",
-            }
-
-            if real_time:
-                selected_model = "gdn" if labels_available else "tcn_prediction"
-            elif num_samples < 1000:
-                selected_model = "donut" if labels_available else "tcn_prediction"
-            elif num_samples > 10_000:
-                selected_model = "anom_trans" if not labels_available else "mtad_gat"
-            else:
-                selected_model = model_choices.get(anomaly_type, "omni_anomaly" if not labels_available else "lstm_prediction")
-
-        # 🔹 Trouver le chemin du modèle dans MODEL_MAP
-        model_path = None
-        for category, models in MODEL_MAP.items():
-            if selected_model in models:
-                model_path = models[selected_model]
-                break
-
-        if not model_path:
-            raise ValueError(f" Modèle {selected_model} introuvable dans MODEL_MAP !")
-
-        # 🔹 Importation dynamique du modèle
-        module_name, class_name = model_path.rsplit(".", 1)  # Séparer module et classe
-        try:
-            module = importlib.import_module(module_name)
-            model_class = getattr(module, class_name)
-            print(f" Modèle sélectionné : {selected_model} ({class_name})")
-
-            #  Vérifier si le modèle sélectionné a des paramètres spécifiques
-            if class_name == "TCNPredictionAnomalyDetector":
-                # Importation dynamique de TCNPrediction
-                prediction_module = importlib.import_module("timesead.models.prediction.tcn_prediction")
-                TCNPrediction = getattr(prediction_module, "TCNPrediction")
-
-                input_dim = data.shape[1]
-                window_size = 50  # Ajuste selon ton pipeline
-                base_model = TCNPrediction(input_dim=input_dim, window_size=window_size)
-
-                model_instance = model_class(base_model)
-                print(f" {class_name} instancié avec input_dim={input_dim}, window_size={window_size}")
-                return model_instance
-
-            elif class_name == "AnomalyTransformer":
-                input_dim = data.shape[1]
-                win_size = 50  # Ajuste selon ton pipeline
-
-                model_instance = model_class(win_size=win_size, input_dim=input_dim)
-                print(f" {class_name} instancié avec win_size={win_size}, input_dim={input_dim}")
-                return model_instance
-
-            #  Pour les modèles qui n'ont pas besoin de paramètres spécifiques
-            return model_class()
-
-        except Exception as e:
-            raise ImportError(f" Erreur lors de l'importation de {selected_model}: {e}")
+    def get_feature_names() -> list:
+        """
+        Retourne les noms des features.
+        Cette implémentation se base sur le nombre de features enregistré lors de l'initialisation.
+        """
+        num_features = getattr(SingleSequenceDataset, "_num_features", 0)
+        return [f"feature_{i+1}" for i in range(num_features)]
             
 class UpstreamDataPreparation:
-    def __init__(self, method=None, threshold=None, seq_length=None, scale_method=None, interpolation_method =None):
+    def __init__(self, method=None, threshold=None, seq_length=None, scale_method=None, interpolation_method=None, window_params=None):
         self.method = method  # Méthode de détection des outliers (IQR ou MAD)
         self.threshold = threshold  # Seuil pour détecter les outliers
         self.seq_length = seq_length  # Longueur des séquences temporelles
         self.scale_method = scale_method  # Méthode de normalisation
         self.interpolation_method = interpolation_method
         self.scaler = None  # Scaler à réutiliser
+        self.window_params = window_params
+        
+    def data_collection(self, file_path, time_col):
+        df = pd.read_csv(file_path, delimiter=';', skiprows=1, low_memory=False) #skiprows a adapter selon la position des colonnes du fichier
+        
+        # Vérifier si la colonne de dates est présente dans le DataFrame
+        if time_col in df.columns:
+            df[time_col] = pd.to_numeric(df[time_col])
+            df.set_index(time_col, inplace=True)
+
+            empty_columns = df.columns[df.isna().all()]
+            print(f"Colonnes totalement vides avant suppression : {list(empty_columns)}")
+
+            df_cleaned = df.dropna(axis=1, how="all")
+            print("Colonnes supprimées !")
+                
+            if not df.index.is_monotonic_increasing: #peu utile car fichiers APL normalement bien indéxés
+                print("L'index n'est pas trié. Tri en cours...")
+                df.sort_index(inplace=True)
+                print("L'index a été trié avec succès.")
+            
+        else:
+            print(f"La colonne '{time_col}' n'a pas été trouvée. L'index par défaut sera utilisé.")
+        
+    
+        return df_cleaned
 
     def compute_dynamic_thresholds(self, data):
         """
@@ -381,13 +316,13 @@ class UpstreamDataPreparation:
         """
         scale_method = self.scale_method.lower()
     
-        if scale_method == "minmax":
+        if scale_method == "minmax": #pas utile
             self.scaler = MinMaxScaler(feature_range=(0, 1))
         elif scale_method == "standard":
             self.scaler = StandardScaler()
         elif scale_method == "robust":
             self.scaler = RobustScaler()
-        elif scale_method == "quantile":
+        elif scale_method == "quantile": #pas utile
             # Vous pouvez choisir 'uniform' ou 'normal' pour output_distribution
             self.scaler = QuantileTransformer(output_distribution='uniform', random_state=0)
         elif scale_method == "power":
@@ -417,11 +352,66 @@ class UpstreamDataPreparation:
         sequences = np.array([data_np[i:i + self.seq_length] for i in range(len(data_np) - self.seq_length)])
         return torch.tensor(sequences, dtype=torch.float32)
     
-    def process(self, data, model_name, train_size=0.8):
+    def process(self, data, train_size=0.8, use_pipeline=True):
         """
-        Pipeline complet : suppression des erreurs capteurs, détection anomalies moteur,
-        normalisation et conversion en séquences temporelles.
+        Pipeline complet : suppression des erreurs capteurs, détection d'anomalies moteur,
+        normalisation et conversion en séquences temporelles via WindowTransform.
+        
+        Cette méthode remplace l'ancienne fonction create_sequences en utilisant un pipeline :
+          1. La série complète est convertie en tenseur.
+          2. Elle est encapsulée dans un SingleSequenceDataset.
+          3. Un DatasetSource avec axe 'time' est créé.
+          4. WindowTransform est appliqué pour extraire des fenêtres glissantes.
         """
+        data_clean, anomalies_motor = self.preprocess_data(data)
+        print("Normalisation des données...")
+        train_data = data_clean.iloc[:int(len(data_clean) * train_size)]
+        test_data = data_clean.iloc[int(len(data_clean) * train_size):]
+        train_data, test_data = self.normalize_data(train_data, test_data)
+        
+        if use_pipeline:
+            # Conversion des DataFrame en tenseurs représentant la série complète
+            train_tensor = torch.tensor(train_data.to_numpy(), dtype=torch.float32)
+            test_tensor = torch.tensor(test_data.to_numpy(), dtype=torch.float32)
+            
+            # Création d'un dataset encapsulant la série complète
+            train_dataset = SingleSequenceDataset(train_tensor)
+            test_dataset = SingleSequenceDataset(test_tensor)
+            
+            # Création d'un DatasetSource avec axe 'time'
+            train_source = DatasetSource(train_dataset, start=0, end=train_dataset.seq_len, axis='time')
+            test_source = DatasetSource(test_dataset, start=0, end=test_dataset.seq_len, axis='time')
+            
+            # Application de WindowTransform pour découper en fenêtres glissantes
+            if self.window_params is not None:
+                window_size = self.window_params.get("window_size")
+                step_size = self.window_params.get("step_size", 1)
+                reverse = self.window_params.get("reverse", False)
+                train_source = WindowTransform(train_source, window_size=window_size, step_size=step_size, reverse=reverse)
+                test_source = WindowTransform(test_source, window_size=window_size, step_size=step_size, reverse=reverse)
+                
+                if self.window_params.get("prediction_horizon") is not None:
+                    horizon = self.window_params["prediction_horizon"]
+                    train_source = PredictionTargetTransform(train_source, window_size=window_size, prediction_horizon=horizon, replace_labels=True)
+                    test_source = PredictionTargetTransform(test_source, window_size=window_size, prediction_horizon=horizon, replace_labels=False)
+
+            
+            # Création du pipeline final
+            train_pipeline = PipelineDataset(train_source)
+            test_pipeline = PipelineDataset(test_source)
+            
+            return train_pipeline, test_pipeline, anomalies_motor
+        else:
+            # Si l'on ne souhaite pas utiliser le pipeline, on retourne directement les tenseurs de la série complète
+            train_tensor = torch.tensor(train_data.to_numpy(), dtype=torch.float32)
+            test_tensor = torch.tensor(test_data.to_numpy(), dtype=torch.float32)
+            return train_tensor, test_tensor, anomalies_motor
+        
+    def process_with_DSsource(self, data, train_size=0.8):
+        """
+        Pipeline complet : nettoyage, normalisation et création de sources de dataset.
+        """
+        
         data_clean, anomalies_motor = self.preprocess_data(data)
         
         print("Normalisation des données...")
@@ -429,12 +419,18 @@ class UpstreamDataPreparation:
         test_data = data_clean.iloc[int(len(data_clean) * train_size):]
         train_data, test_data = self.normalize_data(train_data, test_data)
         
-        X_train_tensor = self.create_sequences(train_data)
-        X_test_tensor = self.create_sequences(test_data)
-
-        torch.save(X_train_tensor, "X_train_tensor.pt")
-        torch.save(X_test_tensor, "X_test_tensor.pt")
-        print("Tenseurs sauvegardés avec succès dans 'X_train_tensor.pt' et 'X_test_tensor.pt'.")
+        # Transformation des DataFrames en objets BaseTSDataset
+        train_dataset = BaseTSDataset(train_data, seq_len=self.seq_length)
+        test_dataset = BaseTSDataset(test_data, seq_len=self.seq_length)
         
-        return X_train_tensor, X_test_tensor, anomalies_motor
+        # Création de DatasetSource pour bénéficier d'un découpage flexible (exemple ici en mode 'batch')
+        train_source = DatasetSource(train_dataset, start=0, end=len(train_dataset), axis='batch')
+        test_source = DatasetSource(test_dataset, start=0, end=len(test_dataset), axis='batch')
+        
+        # Ces DatasetSource peuvent ensuite être utilisés dans le pipeline d'entraînement
+        torch.save(train_source, "train_source.pt")
+        torch.save(test_source, "test_source.pt")
+        print("Les DatasetSource ont été sauvegardés avec succès.")
+        
+        return train_source, test_source, anomalies_motor
         
