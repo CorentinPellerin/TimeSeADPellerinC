@@ -5,12 +5,17 @@ import numpy as np
 import torch.jit
 import torch.nn.functional as F
 import torch.nn as nn
+from torch.nn import MSELoss
 import torch.optim as optim
 import timesead
 import matplotlib.widgets as widgets
 import itertools
 import time
 from torch.utils.data import DataLoader, TensorDataset
+from timesead.optim.trainer import Trainer, default_log_fn, EarlyStoppingHook, CheckpointHook
+from timesead.optim.loss import TorchLossWrapper, LogCoshLoss
+from timesead.evaluation.evaluator import Evaluator
+from timesead.evaluation.ts_precision_recall import ts_precision_and_recall, compute_window_indices
 from timesead.models.reconstruction.lstm_ae import LSTMAEAnomalyDetector, LSTMAEMirza2018, LSTMAEMalhotra2016
 from timesead.models.reconstruction.tcn_ae import TCNAEAnomalyDetector, TCNAE
 from timesead.models.generative.omni_anomaly import OmniAnomaly, OmniAnomalyDetector, OmniAnomalyLoss
@@ -108,7 +113,7 @@ class TCNPredictionTester:
             )
             detector = TCNPredictionAnomalyDetector(base_model)
             
-            criterion = torch.nn.MSELoss()
+            criterion = TorchLossWrapper(torch.nn.MSELoss())
             optimizer = torch.optim.Adam(detector.model.parameters(), lr=1e-3)
             
             # Entraînement (par exemple, 5 époques)
@@ -178,7 +183,7 @@ class TCNPredictionTester:
             raise ValueError("Veuillez d'abord optimiser les hyperparamètres.")
         
         detector = self.best_model
-        criterion = torch.nn.MSELoss()
+        criterion = TorchLossWrapper(torch.nn.MSELoss())
         test_dataset = TensorDataset(
             self.X_test, 
             self.X_test[:, -1, :]
@@ -360,7 +365,7 @@ class TCNS2SPredictionTester:
             # Pour le calcul des erreurs sur le dernier pas, on fixe offset à 1
             detector = TCNS2SPredictionAnomalyDetector(base_model, offset=1)
 
-            criterion = torch.nn.MSELoss()
+            criterion = TorchLossWrapper(torch.nn.MSELoss())
             optimizer = torch.optim.Adam(detector.model.parameters(), lr=param_dict['learning_rate'])
 
             # Entraînement (par exemple, 5 époques)
@@ -425,7 +430,7 @@ class TCNS2SPredictionTester:
             raise ValueError("Veuillez d'abord optimiser les hyperparamètres.")
 
         detector = self.best_model
-        criterion = torch.nn.MSELoss()
+        criterion = TorchLossWrapper(torch.nn.MSELoss())
         test_dataset = TensorDataset(self.X_test, self.X_test)
         test_loader = DataLoader(test_dataset, batch_size=32, collate_fn=collate_fn_tcns2s)
 
@@ -515,6 +520,18 @@ def collate_fn_lstmp(batch):
     # Ici, la cible est identique à l'entrée (on souhaite reproduire la séquence)
     ys = xs.clone()
     return xs, ys
+    
+def collate_fn_lstmp_test(batch):
+    xs, _ = zip(*batch)
+    xs = torch.stack(xs)        # xs a la forme (batch, T, D)
+    xs = xs.transpose(0, 1)      # réorganise pour obtenir (T, batch, D)
+    # Récupérer l'horizon de prédiction à partir du modèle
+    # Ici, on suppose que detector.model est un SingleInputWrapper qui encapsule le modèle original
+    # et que le modèle original est accessible via detector.model.model
+    ph = detector.model.model.prediction_horizon if hasattr(detector.model, 'model') else detector.model.prediction_horizon
+    # Extraire les derniers ph pas temporels
+    ys = xs[-ph:]
+    return xs, (ys, ys)
 
 def full_sequence_forward_lstmp(model, x):
     # Envoie l'input sous forme de tuple si le modèle l'exige.
@@ -547,7 +564,7 @@ class LSTMPredictionTester:
         self.input_dim = X_train.shape[-1]
         self.window_size = X_train.shape[1]
 
-    def optimize_hyperparameters(self):
+    def optimize_hyperparameters_manual(self):
         """
         Recherche sur une grille d'hyperparamètres (par exemple, 'lstm_hidden_dims', 'linear_hidden_layers' et 'learning_rate')
         et choisit la configuration qui minimise la loss sur le jeu de test.
@@ -590,7 +607,7 @@ class LSTMPredictionTester:
             # Encapsulation dans l'anomaly detector
             detector = LSTMPredictionAnomalyDetector(base_model)
 
-            criterion = torch.nn.MSELoss()
+            criterion = LogCoshLoss() #torch.nn.MSELoss()
             optimizer = torch.optim.Adam(detector.model.parameters(), lr=param_dict['learning_rate'])
 
             # Entraînement (5 époques par exemple)
@@ -645,6 +662,130 @@ class LSTMPredictionTester:
         self.best_params = best_params
         self.best_loss = best_loss
         return best_model, best_params, best_loss
+        
+    def optimize_hyperparameters_trainer_timesead(self):
+        """
+        Recherche sur une grille d'hyperparamètres en entraînant le modèle sur self.X_train 
+        et en évaluant sur self.X_test via le Trainer.
+        On choisit la configuration qui minimise un score composite (ici, basé sur la loss).
+        
+        Returns
+        -------
+        best_model : Le modèle LSTMPredictionAnomalyDetector entraîné avec la meilleure configuration.
+        best_params : dict des meilleurs hyperparamètres.
+        best_score : float, le score composite associé.
+        """
+
+        # Définition de la grille d'hyperparamètres
+        param_grid = {
+            'lstm_hidden_dims': [[64, 64, 32]],
+            'linear_hidden_layers': [[100, 50]],
+            'linear_activation': [torch.nn.ELU(), torch.nn.ReLU],
+            'prediction_horizon': [1], #3, 5, 1
+            'learning_rate': [1e-3], #, 5e-4
+            'optimizer': ['adam' ] #,'sgd'
+        }
+        best_score = float('inf')
+        best_params = None
+        best_detector = None
+
+        # Préparation des DataLoader à partir de self.X_train et self.X_test
+        # On transpose pour obtenir la forme (T, N, D) attendue par le modèle
+        train_dataset = TensorDataset(self.X_train.transpose(0, 1), self.X_train.transpose(0, 1))
+        val_dataset   = TensorDataset(self.X_test.transpose(0, 1), self.X_test.transpose(0, 1))
+        train_loader  = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn_lstmp)
+        val_loader    = DataLoader(val_dataset, batch_size=32, collate_fn=collate_fn_lstmp)
+
+        # On définit une fonction de validation basée sur la loss
+        val_metrics = {
+            'loss_0': lambda outputs, targets, inputs, **kwargs: torch.nn.MSELoss()(
+                outputs[0] if isinstance(outputs, tuple) else outputs,
+                targets[0] if isinstance(targets, tuple) else targets
+            )
+        }
+
+        
+        class SingleInputWrapper(torch.nn.Module):
+            def __init__(self, model):
+                super(SingleInputWrapper, self).__init__()
+                self.model = model
+                #self.target_horizon = target_horizon
+            def forward(self, inputs):
+                # On prend le premier élément du tuple d'entrée
+                x = inputs[0]
+                #original_horizon = self.model.prediction_horizon #
+                # Forcer l'horizon à 1 pour éviter le reshape invalide dans le forward du modèle
+                #self.model.prediction_horizon = 1 #
+                out = self.model((x,))
+                #self.model.prediction_horizon = original_horizon #
+                # Transposer pour passer de (T, N, D) à (N, T, D) si nécessaire
+                out = out.transpose(0,1)
+                #out = out.repeat(1, self.target_horizon, 1) #
+                return out
+            def grouped_parameters(self):
+                # Redirige vers la méthode grouped_parameters du modèle interne
+                return self.model.grouped_parameters()
+
+
+        # Boucle sur les configurations de la grille
+        for params in itertools.product(*param_grid.values()):
+            param_dict = dict(zip(param_grid.keys(), params))
+            start_time = time.time()
+
+            # Instanciation du modèle avec les hyperparamètres en cours
+            base_model = LSTMPrediction(
+                input_dim=self.input_dim,
+                lstm_hidden_dims=param_dict['lstm_hidden_dims'],
+                linear_hidden_layers=param_dict['linear_hidden_layers'],
+                prediction_horizon=param_dict['prediction_horizon']
+            )
+            # Encapsulation dans le détecteur d'anomalies
+            detector = LSTMPredictionAnomalyDetector(base_model)
+
+            # Choix de l'optimiseur
+            if param_dict['optimizer'] == 'adam':
+                optimizer = torch.optim.Adam(detector.model.parameters(), lr=param_dict['learning_rate'])
+            else:
+                optimizer = torch.optim.SGD(detector.model.parameters(), lr=param_dict['learning_rate'])
+
+            # Création d'un Trainer local pour cette configuration
+            local_trainer = Trainer(
+                train_iter=train_loader,
+                val_iter=val_loader,
+                optimizer=lambda params: optimizer,
+                scheduler=lambda opt: torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[3, 4]),
+            )
+            # Ajout d'un hook d'early stopping sur la loss (optionnel)
+            early_stopping = EarlyStoppingHook(metric='loss_0', invert_metric=False, patience=3)
+            local_trainer.add_hook(early_stopping, 'post_validation')
+
+            if not hasattr(detector.model, 'grouped_parameters'):
+                detector.model.grouped_parameters = lambda: [detector.model.parameters()]
+                
+            wrapped_loss = LogCoshLoss() #TorchLossWrapper(torch.nn.MSELoss())
+            wrapped_model = SingleInputWrapper(detector.model)
+            # Entraînement du modèle avec torch.nn.MSELoss()
+            local_trainer.train(wrapped_model, losses=wrapped_loss, num_epochs=5, val_metrics=val_metrics, log_fn=default_log_fn())
+            # Évaluation sur le set de validation
+            val_result = local_trainer.validate_model_once(wrapped_model, val_metrics, epoch=5, num_epochs=5)
+            avg_loss = val_result['loss_0']
+
+            # Ici, le score composite est défini comme la loss moyenne (on peut l'étendre en combinant d'autres métriques)
+            composite_score = avg_loss
+
+            elapsed_time = time.time() - start_time
+            print(f"Config {param_dict} : Loss = {avg_loss:.4f}, Score = {composite_score:.4f} (Temps: {elapsed_time:.2f}s)")
+
+            if composite_score < best_score:
+                best_score = composite_score
+                best_params = param_dict
+                best_detector = detector
+
+        print("\nMeilleurs hyperparamètres:", best_params, "avec score", best_score)
+        self.best_model = best_detector
+        self.best_params = best_params
+        self.best_score = best_score
+        return best_detector, best_params, best_score
 
     def test_model(self):
         """
@@ -655,7 +796,7 @@ class LSTMPredictionTester:
             raise ValueError("Veuillez d'abord optimiser les hyperparamètres.")
         
         detector = self.best_model
-        criterion = torch.nn.MSELoss()
+        criterion = LogCoshLoss() #torch.nn.MSELoss()
         test_dataset = TensorDataset(self.X_test.transpose(0, 1), self.X_test.transpose(0, 1))
         test_loader = DataLoader(test_dataset, batch_size=32, collate_fn=collate_fn_lstmp)
 
@@ -670,6 +811,100 @@ class LSTMPredictionTester:
         print(f"Loss sur l'ensemble de test : {test_loss}")
         self.test_loss = test_loss
         return test_loss
+        
+    def test_model_with_metrics(self, threshold_percentile):
+        """
+        Teste le modèle optimisé en calculant non seulement la loss sur le jeu de test,
+        mais également plusieurs métriques d'évaluation spécifiques à la détection d'anomalies.
+        Ces métriques incluent F1, AUC, AUPRC, TRec et TPrec.
+        
+        On suppose que la méthode get_labels_and_scores du détecteur retourne
+        un tuple (labels, scores) où labels et scores sont des tenseurs de même taille.
+        
+        Retourne :
+            dict: un dictionnaire récapitulant les métriques calculées.
+        """
+
+        # On suppose que compute_TRec et compute_TPrec sont disponibles et importées
+        # from time_sead_metrics import compute_TRec, compute_TPrec
+
+        if not hasattr(self, 'best_model'):
+            raise ValueError("Veuillez d'abord optimiser les hyperparamètres.")
+
+        detector = self.best_model
+
+        # Préparation du DataLoader pour le test (utilisation directe de self.X_test)
+        test_dataset = TensorDataset(self.X_test.transpose(0, 1), self.X_test.transpose(0, 1))
+        test_loader = DataLoader(test_dataset, batch_size=32, collate_fn=collate_fn_lstmp_test)
+        
+        class SingleInputWrapper(torch.nn.Module):
+            def __init__(self, model):
+                super(SingleInputWrapper, self).__init__()
+                self.model = model
+                #self.target_horizon = target_horizon
+            def forward(self, inputs):
+                # On prend le premier élément du tuple d'entrée
+                x = inputs[0]
+                #original_horizon = self.model.prediction_horizon #
+                # Forcer l'horizon à 1 pour éviter le reshape invalide dans le forward du modèle
+                #self.model.prediction_horizon = 1 #
+                out = self.model((x,))
+                #self.model.prediction_horizon = original_horizon #
+                # Transposer pour passer de (T, N, D) à (N, T, D) si nécessaire
+                out = out.transpose(0,1)
+                #out = out.repeat(1, self.target_horizon, 1) #
+                return out
+            def grouped_parameters(self):
+                # Redirige vers la méthode grouped_parameters du modèle interne
+                return self.model.grouped_parameters()
+                
+        # Avant de tester, on enveloppe le modèle pour qu'il ne prenne que le premier élément de l'entrée
+        detector.model = SingleInputWrapper(detector.model)
+
+
+        # Récupération des labels et scores d'anomalie via la méthode du détecteur
+        labels, scores = detector.get_labels_and_scores(test_loader)
+        y_true = labels.numpy()
+        anomaly_scores = scores.numpy()
+
+        # Définition d'un seuil pour binariser les scores, par exemple le 95e percentile
+        threshold = np.percentile(anomaly_scores, threshold_percentile)
+        y_pred = (anomaly_scores > threshold).astype(int)
+
+        # Calcul des métriques classiques
+        f1 = f1_score(y_true, y_pred)
+        auc = roc_auc_score(y_true, anomaly_scores)
+        auprc = average_precision_score(y_true, anomaly_scores)
+
+        # Calcul des métriques spécifiques TimeSeAD (TRec, TPrec)
+        try:
+            from time_sead_metrics import compute_TRec, compute_TPrec
+            t_rec = compute_TRec(y_true, anomaly_scores, threshold)
+            t_prec = compute_TPrec(y_true, anomaly_scores, threshold)
+        except ImportError:
+            t_rec = None
+            t_prec = None
+
+        print("Résultats sur le jeu de test :")
+        print(f"F1 Score: {f1:.4f}")
+        print(f"AUC: {auc:.4f}")
+        print(f"AUPRC: {auprc:.4f}")
+        if t_rec is not None and t_prec is not None:
+            print(f"TRec: {t_rec:.4f}")
+            print(f"TPrec: {t_prec:.4f}")
+        else:
+            print("TRec et TPrec n'ont pas pu être calculés (fonctions non disponibles).")
+
+        # Retourne un dictionnaire récapitulatif
+        return {
+            "F1": f1,
+            "AUC": auc,
+            "AUPRC": auprc,
+            "TRec": t_rec,
+            "TPrec": t_prec,
+            "Threshold": threshold
+        }
+
 
     def plot_anomaly_scores(self):
         """
@@ -839,7 +1074,7 @@ class LSTMAETester:
                 batch_size=32, collate_fn=collate_fn
             )
             
-            criterion = torch.nn.MSELoss()
+            criterion = TorchLossWrapper(torch.nn.MSELoss())
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
             
             # Entraînement (5 époques pour accélérer)
@@ -906,7 +1141,7 @@ class LSTMAETester:
             raise ValueError("Veuillez d'abord optimiser les hyperparamètres.")
         
         model = self.best_model
-        criterion = torch.nn.MSELoss()
+        criterion = TorchLossWrapper(torch.nn.MSELoss())
         # Pour LSTM-AE, le modèle attend des tenseurs de forme (T, B, D)
         test_data_transposed = self.X_test.transpose(0, 1)  # (T, B, D)
         with torch.no_grad():
@@ -1026,7 +1261,7 @@ class LSTMAEMALHOTRATester:
                 batch_size=32, collate_fn=collate_fn
             )
             
-            criterion = torch.nn.MSELoss()
+            criterion = TorchLossWrapper(torch.nn.MSELoss())
             optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
             
             # Entraînement (par exemple, 5 époques)
@@ -1036,7 +1271,7 @@ class LSTMAEMALHOTRATester:
                     # Selon votre collate_fn, x est de forme (T, B, D)
                     x = batch[0] if isinstance(batch, tuple) else batch
                     optimizer.zero_grad()
-                    output = full_sequence_forward_lstmp(model.model, x)
+                    output = full_sequence_forward_lstm(model.model, x)
                     loss = criterion(output, x)
                     loss.backward()
                     optimizer.step()
@@ -1050,7 +1285,7 @@ class LSTMAEMALHOTRATester:
             with torch.no_grad():
                 for batch, _ in train_loader:
                     x = batch[0] if isinstance(batch, tuple) else batch  # (T, B, D)
-                    output = full_sequence_forward_lstmp(model.model, x)
+                    output = full_sequence_forward_lstm(model.model, x)
                     # Calcul de l'erreur absolue sur toute la séquence, moyennée sur T
                     error = torch.abs(x - output).mean(dim=0)  # (B, D)
                     all_errors.append(error)
@@ -1071,7 +1306,7 @@ class LSTMAEMALHOTRATester:
             with torch.no_grad():
                 for batch, _ in test_loader:
                     x = batch[0] if isinstance(batch, tuple) else batch
-                    output = full_sequence_forward_lstmp(model.model, x)
+                    output = full_sequence_forward_lstm(model.model, x)
                     total_loss += criterion(output, x).item()
             test_loss = total_loss / len(test_loader)
             elapsed_time = time.time() - start_time
@@ -1097,11 +1332,11 @@ class LSTMAEMALHOTRATester:
             raise ValueError("Veuillez d'abord optimiser les hyperparamètres.")
         
         model = self.best_model
-        criterion = torch.nn.MSELoss()
+        criterion = TorchLossWrapper(torch.nn.MSELoss())
         # Transposition pour obtenir (T, B, D)
         test_data_transposed = self.X_test.transpose(0, 1)
         with torch.no_grad():
-            test_outputs = full_sequence_forward_lstmp(model.model, test_data_transposed)
+            test_outputs = full_sequence_forward(model.model, test_data_transposed)
         print("Test outputs shape:", test_outputs.shape)
         test_loss = criterion(test_outputs, test_data_transposed).item()
         print(f"Loss sur l'ensemble de test : {test_loss}")
